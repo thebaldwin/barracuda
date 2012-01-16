@@ -137,6 +137,22 @@ class TestProgram < Test::Unit::TestCase
     p.sum(out, input, :times => input.size / 2)
     assert_equal sum, out[0]
   end
+
+  def test_program_set_global_work_size
+    p = Program.new <<-CL
+      #{EXTENSIONS}
+      __kernel void sum(__global int* out, __global int* in) {
+        int y = get_global_id(0);
+        int x = get_global_id(1);
+        out[y*2 + x] = y*2 + x;
+      }
+    CL
+
+    input = (0..5).to_a
+    out = Buffer.new(6)
+    p.sum(out, input, :global_work_size => [3,2])
+    assert_equal [0,1,2,3,4,5], out
+  end
   
   def test_program_largest_buffer_is_input
     p = Program.new <<-CL

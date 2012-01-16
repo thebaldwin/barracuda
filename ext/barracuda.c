@@ -19,7 +19,9 @@ static VALUE rb_eOpenCLError;
 static VALUE rb_cType;
 static VALUE rb_hTypes;
 
-static ID id_times;
+static ID id_work_dim;
+static ID id_local_work_size;
+static ID id_global_work_size;
 static ID id_to_s;
 static ID id_new;
 static ID id_object;
@@ -508,7 +510,11 @@ static VALUE
 program_method_missing(int argc, VALUE *argv, VALUE self)
 {
     int i;
-    size_t global[3] = {1, 1, 1}, local[3] = {0, 1, 1}, tmp;
+    size_t global_work_size[3] = {1, 1, 1}, local_work_size[3] = {0, 1, 1}, tmp;
+    int work_dim = 3;
+
+    int user_set_global_work = 0;
+
     cl_kernel kernel;
     cl_command_queue commands;
     VALUE result;
@@ -531,14 +537,59 @@ program_method_missing(int argc, VALUE *argv, VALUE self)
         err = !CL_SUCCESS;
         
         if (i == argc - 1 && TYPE(item) == T_HASH) {
-            VALUE worker_size = rb_hash_aref(item, ID2SYM(id_times));
-            if (RTEST(worker_size) && TYPE(worker_size) == T_FIXNUM) {
-                global[0] = FIX2UINT(worker_size);
+            VALUE v_work_dim = rb_hash_aref(item, ID2SYM(id_work_dim));
+
+            if (RTEST(v_work_dim)) {
+                int tmp_work_dim = FIX2UINT(v_work_dim);
+
+                if (TYPE(v_work_dim) == T_FIXNUM && tmp_work_dim > 0 && tmp_work_dim <= 3) {
+                    work_dim = tmp_work_dim;
+                } else {
+                    CLEAN();
+                    rb_raise(rb_eArgError, ":work_dim must be an integer > 0 and <= 3. opts was: %s", RSTRING_PTR(rb_inspect(item)));
+                }
             }
-            else {
-                CLEAN();
-                rb_raise(rb_eArgError, "opts hash must be {:times => INT_VALUE}, got %s",
-                    RSTRING_PTR(rb_inspect(item)));
+
+            //TODO: refactor global/local logic
+            VALUE v_global_work_size = rb_hash_aref(item, ID2SYM(id_global_work_size));
+            if (RTEST(v_global_work_size)) {
+                user_set_global_work = 1;
+                if (TYPE(v_global_work_size) == T_ARRAY && RARRAY_LEN(v_global_work_size) <= work_dim) {
+                    int i;
+                    for (i = 0; i < RARRAY_LEN(v_global_work_size); i++) {
+                        VALUE v = RARRAY_PTR(v_global_work_size)[i];
+                        if (RTEST(v) && TYPE(v) == T_FIXNUM) {
+                            global_work_size[i] = FIX2UINT(v);
+                        } else {
+                          CLEAN();
+                          rb_raise(rb_eArgError, "Elements of :global_work_size must be integers.");
+                        }
+                    }
+                } else {
+                    CLEAN();
+                    rb_raise(rb_eArgError, ":global_work_size must be an array of integers with size equal to :work_dim. eg: {:work_dim => 2, :global_work_size => [128, 128] }, opts was: %s",
+                        RSTRING_PTR(rb_inspect(item)));
+                }
+            }
+
+            VALUE v_local_work_size = rb_hash_aref(item, ID2SYM(id_local_work_size));
+            if (RTEST(v_local_work_size)) {
+                if (TYPE(v_local_work_size) == T_ARRAY && RARRAY_LEN(v_local_work_size) <= work_dim) {
+                    int i;
+                    for (i = 0; i < RARRAY_LEN(v_local_work_size); i++) {
+                        VALUE v = RARRAY_PTR(v_local_work_size)[i];
+                        if (RTEST(v) && TYPE(v) == T_FIXNUM) {
+                            local_work_size[i] = FIX2UINT(v);
+                        } else {
+                          CLEAN();
+                          rb_raise(rb_eArgError, "Elements of :local_work_size must be integers.");
+                        }
+                    }
+                } else {
+                    CLEAN();
+                    rb_raise(rb_eArgError, ":local_work_size must be an array of integers with size equal to :work_dim. eg: {:work_dim => 2, :local_work_size => [128, 128] }, opts was: %s",
+                        RSTRING_PTR(rb_inspect(item)));
+                }
             }
             break;
         }
@@ -547,7 +598,6 @@ program_method_missing(int argc, VALUE *argv, VALUE self)
             /* create buffer from arg */
             argv[i] = item = rb_funcall(rb_cBuffer, id_new, 1, item);
         }
-
         if (CLASS_OF(item) == rb_cBuffer) {
             struct buffer *buffer;
             Data_Get_Struct(rb_ivar_get(item, id_buffer_data), struct buffer, buffer);
@@ -555,8 +605,12 @@ program_method_missing(int argc, VALUE *argv, VALUE self)
             buffer_update_cache(item);
             buffer_write(item, commands);
             err = clSetKernelArg(kernel, i - 1, sizeof(cl_mem), &buffer->data);
-            if (RARRAY_LEN(item) > global[0]) {
-                global[0] = RARRAY_LEN(item);
+
+            // Find the biggest param and use that if the user didn't provide global_work_size
+            if (user_set_global_work == 0) {
+                if (RARRAY_LEN(item) > global_work_size[0]) {
+                    global_work_size[0] = RARRAY_LEN(item);
+                }
             }
         }
         else {
@@ -590,7 +644,7 @@ program_method_missing(int argc, VALUE *argv, VALUE self)
     }
     
     err = clGetKernelWorkGroupInfo(kernel, device_id, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &tmp, NULL);
-    err = clEnqueueNDRangeKernel(commands, kernel, 3, NULL, global, local[0] == 0 ? NULL : local, 0, NULL, NULL);
+    err = clEnqueueNDRangeKernel(commands, kernel, work_dim, NULL, global_work_size, local_work_size[0] == 0 ? NULL : local_work_size, 0, NULL, NULL);
     if (err != CL_SUCCESS) { 
         CLEAN(); 
         if (err == CL_INVALID_KERNEL_ARGS) {
@@ -662,7 +716,10 @@ init_opencl()
 void
 Init_barracuda()
 {
-    id_times = rb_intern("times");
+    id_work_dim = rb_intern("work_dim");
+    id_local_work_size = rb_intern("local_work_size");
+    id_global_work_size = rb_intern("global_work_size");
+
     id_new = rb_intern("new");
     id_to_s = rb_intern("to_s");
     id_data_type = rb_intern("data_type");
